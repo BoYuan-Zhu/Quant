@@ -10,3 +10,7 @@
 
 !stock-backtrader-web-app/
 !stock-backtrader-web-app/**
+
+
+!requirements/
+!requirements/**
