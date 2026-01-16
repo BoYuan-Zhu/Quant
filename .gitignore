@@ -1,0 +1,12 @@
+# created by virtualenv automatically
+*
+
+# Keep the ignore file itself
+!.gitignore
+
+# Allow these two folders (and everything inside them)
+!functions/
+!functions/**
+
+!stock-backtrader-web-app/
+!stock-backtrader-web-app/**
