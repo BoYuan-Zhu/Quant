@@ -12,5 +12,5 @@
 !stock-backtrader-web-app/**
 
 
-!requirements/
-!requirements/**
+!requirements.txt/
+!requirements.txt/**
