@@ -12,4 +12,3 @@
 !stock-backtrader-web-app/**
 
 !requirements.txt
-!functions/test.py
