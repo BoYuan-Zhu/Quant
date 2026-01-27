@@ -3,42 +3,122 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
+import time
+import pandas as pd
+import akshare as ak
+
+
 class SingleStock:
-    #symbol 给出股票代码
-    # period choice of {'daily', 'weekly', 'monthly'}
-    # adjust默认返回不复权的数据; qfq: 返回前复权后的数据; hfq: 返回后复权后的数据
-    def __init__(self, symbol: str, period: str = "daily", adjust: str = "" ):
+    """
+    Unified A-share stock data fetcher.
+
+    source:
+        - "em"      : Eastmoney (default)
+        - "sina"    : Sina
+        - "tencent" : Tencent
+    """
+
+    def __init__(
+        self,
+        symbol: str,
+        period: str = "daily",
+        adjust: str = "qfq",
+        source: str = "em",
+        sleep: float = 1.0,
+    ):
         self.symbol = symbol
         self.period = period
         self.adjust = adjust
-        self.data = None  # pd.DataFrame after fetch()
+        self.source = source.lower()
+        self.sleep = sleep
+        self.data = None
+
+        self._fetcher_map = {
+            "em": self._fetch_from_em,
+            "sina": self._fetch_from_sina,
+            "tencent": self._fetch_from_tencent,
+        }
+
+        if self.source not in self._fetcher_map:
+            raise ValueError(f"Unsupported data source: {self.source}")
+
+    # ===================== public API =====================
 
     def fetch(self, start_date: str, end_date: str) -> pd.DataFrame:
         """
         R: Input symbol/period/start/end/adjust
-        M: Fetch OHLCV data from AkShare
-        E: self.data is updated and returned
+        M: Fetch OHLCV data from selected source
+        E: self.data updated and returned
         """
-        df = ak.stock_zh_a_hist(
+        df = self._fetcher_map[self.source](start_date, end_date)
+
+        if df is None or df.empty:
+            raise RuntimeError(f"No data returned from source={self.source}")
+
+        df = self._normalize_dataframe(df)
+        self.data = df
+
+        if self.sleep > 0:
+            time.sleep(self.sleep)
+
+        return df
+
+    # ===================== data sources =====================
+
+    def _fetch_from_em(self, start_date: str, end_date: str) -> pd.DataFrame:
+        return ak.stock_zh_a_hist(
             symbol=self.symbol,
             period=self.period,
             start_date=start_date,
             end_date=end_date,
-            adjust=self.adjust
+            adjust=self.adjust,
+            timeout=30,
         )
 
-        # Ensure date index for time-series operations
+    def _fetch_from_sina(self, start_date: str, end_date: str) -> pd.DataFrame:
+        if self.period != "daily":
+            raise ValueError("Sina only supports daily data")
+
+        df = ak.stock_zh_a_daily(symbol=self.symbol,start_date=start_date, end_date=end_date, adjust = self.adjust)
+        return df.reset_index()
+
+    def _fetch_from_tencent(self, start_date: str, end_date: str) -> pd.DataFrame:
+        if self.period != "daily":
+            raise ValueError("Tencent only supports daily data")
+
+        df = ak.stock_zh_a_hist_tx(symbol=self.symbol,start_date=start_date, end_date=end_date, adjust = self.adjust)
+        return df.reset_index()
+
+    # ===================== normalization =====================
+
+    def _normalize_dataframe(self, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Normalize column names and index for downstream usage.
+        """
+        column_map = {
+            "date": "日期",
+            "open": "开盘",
+            "close": "收盘",
+            "high": "最高",
+            "low": "最低",
+            "volume": "成交量",
+            "amount": "成交额",
+            "turnover":"换手率"
+        }
+
+        # 新浪 / 腾讯是英文字段
+        df = df.rename(columns=column_map)
+
         if "日期" in df.columns:
             df["日期"] = pd.to_datetime(df["日期"])
             df = df.sort_values("日期").set_index("日期")
 
-        # Convert numeric columns to float when possible
         for col in ["开盘", "收盘", "最高", "最低", "成交量", "成交额"]:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        self.data = df
         return df
+
 
     def _require_data(self):
         if self.data is None or self.data.empty:
@@ -69,17 +149,17 @@ class SingleStock:
 
     def amount(self) -> pd.Series:
         return self.get_column("成交额")
-    def amplitude(self) -> pd.Series:
-        """Price amplitude (%)"""
-        return self.get_column("振幅")
-
-    def pct_change(self) -> pd.Series:
-        """Daily percentage change (%)"""
-        return self.get_column("涨跌幅")
-
-    def change(self) -> pd.Series:
-        """Daily price change"""
-        return self.get_column("涨跌额")
+    # def amplitude(self) -> pd.Series:
+    #     """Price amplitude (%)"""
+    #     return self.get_column("振幅")
+    #
+    # def pct_change(self) -> pd.Series:
+    #     """Daily percentage change (%)"""
+    #     return self.get_column("涨跌幅")
+    #
+    # def change(self) -> pd.Series:
+    #     """Daily price change"""
+    #     return self.get_column("涨跌额")
 
     def turnover(self) -> pd.Series:
         """Turnover rate (%)"""
