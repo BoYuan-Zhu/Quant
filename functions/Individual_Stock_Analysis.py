@@ -4,8 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 import time
-import pandas as pd
-import akshare as ak
+
 
 
 class SingleStock:
@@ -164,6 +163,8 @@ class SingleStock:
     def turnover(self) -> pd.Series:
         """Turnover rate (%)"""
         return self.get_column("换手率")
+
+    # def financial_report(self, date: str):
 
 
     ##############################################   基本数据计算  #####################################################
