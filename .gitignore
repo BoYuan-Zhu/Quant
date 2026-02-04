@@ -8,6 +8,9 @@
 !functions/
 !functions/**
 
+!strategy/
+!strategy/**
+
 !stock-backtrader-web-app/
 !stock-backtrader-web-app/**
 
