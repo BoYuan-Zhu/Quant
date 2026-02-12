@@ -34,6 +34,7 @@ class PandasMACDData(bt.feeds.PandasData):
         ('high', 'high'),
         ('low',  'low'),
         ('close','close'),
+        ('volume',-1),
         ('openinterest', -1),
 
         ('dif',  'MACD_DIF_12_26_close'),
