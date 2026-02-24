@@ -1,26 +1,34 @@
+import os
 import time
+import hashlib
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
 
 import akshare as ak
 import pandas as pd
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]  # 根据你文件层级调整
+Data_dir = PROJECT_ROOT / "data" / "fundamentals"
 
 
 @dataclass(frozen=True)
 class CacheItem:
-    """Simple cache item container."""
+    """Simple in-memory cache item container."""
     ts: float
     df: pd.DataFrame
 
 
 class FundamentalData:
     """
-    Unified A-share fundamental data fetcher based on AkShare.
+    Unified A-share fundamental data fetcher (AkShare/Eastmoney) with disk caching.
 
-    Design:
-    - Provide a stable class API even if AkShare endpoints rename.
-    - Built-in rate limit (sleep), retry, and in-memory TTL cache.
-    - Return raw DataFrame from AkShare by default (minimal assumptions).
+    Key features:
+    - Stable class API for common fundamental endpoints
+    - Rate limit (sleep), retry
+    - Disk cache: save fetched DataFrame to CSV; next run loads from disk first
+    - Optional in-memory TTL cache (fast within a single process)
     """
 
     def __init__(
@@ -31,211 +39,288 @@ class FundamentalData:
         timeout: int = 30,
         cache_ttl: float = 3600.0,
         max_retries: int = 2,
+        data_dir: str = str(Data_dir),   # <--- NEW: disk cache root
+        prefer_disk: bool = True,              # <--- NEW: disk first
+        disk_cache: bool = True,               # <--- NEW: save to disk
     ):
-        # Store normalized 6-digit code and inferred/explicit exchange.
+        # Normalize symbol
         self.symbol, self.exchange = self._normalize_stock_symbol(symbol)
+
         self.source = source.lower()
         self.sleep = float(sleep)
         self.timeout = int(timeout)
         self.cache_ttl = float(cache_ttl)
         self.max_retries = int(max_retries)
 
-        # In-memory cache: key -> CacheItem
+        # Disk cache settings
+        self.data_dir = Path(data_dir)
+        self.prefer_disk = bool(prefer_disk)
+        self.disk_cache = bool(disk_cache)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+
+        # In-memory cache
         self._cache: Dict[Tuple[str, Tuple[Tuple[str, Any], ...]], CacheItem] = {}
 
-        # Source routing (easy to extend later if you add other providers)
-        self._fetcher_map = {
-            "em": self._fetch_from_em,
-        }
+        self._fetcher_map = {"em": self._fetch_from_em}
         if self.source not in self._fetcher_map:
             raise ValueError(f"Unsupported source: {self.source}")
 
     # ========================= Public APIs =========================
 
-    def info(self, use_cache: bool = True) -> pd.DataFrame:
-        """
-        R: self.symbol
-        M: Fetch basic individual info (market cap, float cap, etc.)
-        E: Return DataFrame
-        """
-        return self._fetcher_map[self.source]("info", use_cache=use_cache)
+    def info(self, use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        return self._fetcher_map[self.source]("info", use_cache=use_cache, force_refresh=force_refresh)
 
-    def balance_sheet(self, mode: str = "report", use_cache: bool = True) -> pd.DataFrame:
-        """
-        mode:
-          - "report": by report period
-          - "yearly": by yearly
-        """
-        return self._fetcher_map[self.source]("balance_sheet", mode=mode, use_cache=use_cache)
+    def balance_sheet(self, mode: str = "report", use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        return self._fetcher_map[self.source]("balance_sheet", mode=mode, use_cache=use_cache, force_refresh=force_refresh)
 
-    def profit_sheet(self, mode: str = "report", use_cache: bool = True) -> pd.DataFrame:
-        """
-        mode:
-          - "report": by report period
-          - "yearly": by yearly
-          - "quarterly": by single quarter
-        """
-        return self._fetcher_map[self.source]("profit_sheet", mode=mode, use_cache=use_cache)
+    def profit_sheet(self, mode: str = "report", use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        return self._fetcher_map[self.source]("profit_sheet", mode=mode, use_cache=use_cache, force_refresh=force_refresh)
 
-    def cash_flow_sheet(self, mode: str = "report", use_cache: bool = True) -> pd.DataFrame:
-        """
-        mode:
-          - "report": by report period
-          - "yearly": by yearly
-          - "quarterly": by single quarter
-        """
-        return self._fetcher_map[self.source]("cash_flow_sheet", mode=mode, use_cache=use_cache)
+    def cash_flow_sheet(self, mode: str = "report", use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        return self._fetcher_map[self.source]("cash_flow_sheet", mode=mode, use_cache=use_cache, force_refresh=force_refresh)
 
     def financial_analysis_indicator(
-            self,
-            start_year: str = "2010",
-            use_cache: bool = True
+        self,
+        start_year: str = "2010",
+        use_cache: bool = True,
+        force_refresh: bool = False,
     ) -> pd.DataFrame:
-        """
-        R: start_year, use_cache
-        M: Fetch financial analysis indicators from AkShare
-        E: Return DataFrame
-        """
         return self._fetcher_map[self.source](
             "financial_analysis_indicator",
             start_year=start_year,
-            use_cache=use_cache
+            use_cache=use_cache,
+            force_refresh=force_refresh,
         )
 
-    def financial_abstract(self, use_cache: bool = True) -> pd.DataFrame:
-        """
-        Financial abstract (key summary fields).
-        Note: Some AkShare versions may not expose this endpoint.
-        """
-        return self._fetcher_map[self.source]("financial_abstract", use_cache=use_cache)
+    def financial_abstract(self, use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        return self._fetcher_map[self.source]("financial_abstract", use_cache=use_cache, force_refresh=force_refresh)
 
-    def valuation_em(self, use_cache: bool = True) -> pd.DataFrame:
-        """
-        R: use_cache
-        M: Fetch valuation and market-based indicators from Eastmoney
-        E: Return DataFrame
+    def valuation_em(self, use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        # Keep public API name; internally treat as endpoint "valuation_em"
+        return self._fetcher_map[self.source]("valuation_em", use_cache=use_cache, force_refresh=force_refresh)
 
-        Underlying AkShare function:
-        - stock_value_em(symbol="601398")
+    def dividend_cninfo(self, use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        return self._fetcher_map[self.source]("dividend_cninfo", use_cache=use_cache, force_refresh=force_refresh)
 
-        Notes:
-        - This provides valuation-related time series such as PE, PB, PS,
-          total market value, circulating market value, etc.
-        - Symbol format: 6-digit stock code without exchange prefix.
-        """
-        return self._call_ak(
-            "stock_value_em",
-            symbol=self.symbol,
-            use_cache=use_cache
-        )
-
-    def dividend_cninfo(self, use_cache: bool = True) -> pd.DataFrame:
-        """
-        Dividend history from CNINFO.
-        """
-        return self._fetcher_map[self.source]("dividend_cninfo", use_cache=use_cache)
-
-    def history_dividend(self, use_cache: bool = True) -> pd.DataFrame:
-        """
-        Historical dividend (AkShare provides multiple endpoints; this one is common).
-        If not available in your version, you will get a helpful error.
-        """
-        return self._fetcher_map[self.source]("history_dividend", use_cache=use_cache)
+    def history_dividend(self, use_cache: bool = True, force_refresh: bool = False) -> pd.DataFrame:
+        return self._fetcher_map[self.source]("history_dividend", use_cache=use_cache, force_refresh=force_refresh)
 
     # ========================= Source Implementations =========================
 
     def _fetch_from_em(self, endpoint: str, **kwargs) -> pd.DataFrame:
         """
         Eastmoney-centric endpoints (most A-share fundamentals live here in AkShare).
+
+        kwargs may include:
+        - use_cache: bool (memory+disk)
+        - force_refresh: bool (ignore disk/memory and fetch from network)
+        - mode/start_year
         """
+        # Keep kwargs but avoid leaking internal flags into AkShare calls
+        use_cache = kwargs.pop("use_cache", True)
+        force_refresh = kwargs.pop("force_refresh", False)
+
         if endpoint == "info":
-            # Doc: symbol is 6-digit code, e.g. "603777".
-            return self._call_ak("stock_individual_info_em", symbol=self.symbol, timeout=self.timeout, **kwargs)
+            return self._call_ak_cached(
+                func_name="stock_individual_info_em",
+                func_kwargs={"symbol": self.symbol, "timeout": self.timeout},
+                cache_id=("info", {}),
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+            )
 
         if endpoint == "balance_sheet":
             mode = kwargs.pop("mode", "report")
             if mode == "report":
-                # Doc: symbol is prefixed, e.g. "SH600519".
-                return self._call_ak("stock_balance_sheet_by_report_em", symbol=self._em_symbol_upper(), **kwargs)
-            if mode == "yearly":
-                return self._call_ak("stock_balance_sheet_by_yearly_em", symbol=self._em_symbol_upper(), **kwargs)
-            raise ValueError(f"Unsupported balance_sheet mode: {mode}")
+                func_name = "stock_balance_sheet_by_report_em"
+            elif mode == "yearly":
+                func_name = "stock_balance_sheet_by_yearly_em"
+            else:
+                raise ValueError(f"Unsupported balance_sheet mode: {mode}")
+
+            return self._call_ak_cached(
+                func_name=func_name,
+                func_kwargs={"symbol": self._em_symbol_upper()},
+                cache_id=("balance_sheet", {"mode": mode}),
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+            )
 
         if endpoint == "profit_sheet":
             mode = kwargs.pop("mode", "report")
             if mode == "report":
-                # Doc: symbol is prefixed, e.g. "SH600519".
-                return self._call_ak("stock_profit_sheet_by_report_em", symbol=self._em_symbol_upper(), **kwargs)
-            if mode == "yearly":
-                return self._call_ak("stock_profit_sheet_by_yearly_em", symbol=self._em_symbol_upper(), **kwargs)
-            if mode == "quarterly":
-                return self._call_ak("stock_profit_sheet_by_quarterly_em", symbol=self._em_symbol_upper(), **kwargs)
-            raise ValueError(f"Unsupported profit_sheet mode: {mode}")
+                func_name = "stock_profit_sheet_by_report_em"
+            elif mode == "yearly":
+                func_name = "stock_profit_sheet_by_yearly_em"
+            elif mode == "quarterly":
+                func_name = "stock_profit_sheet_by_quarterly_em"
+            else:
+                raise ValueError(f"Unsupported profit_sheet mode: {mode}")
+
+            return self._call_ak_cached(
+                func_name=func_name,
+                func_kwargs={"symbol": self._em_symbol_upper()},
+                cache_id=("profit_sheet", {"mode": mode}),
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+            )
 
         if endpoint == "cash_flow_sheet":
             mode = kwargs.pop("mode", "report")
             if mode == "report":
-                # Doc: symbol is prefixed, e.g. "SH600519".
-                return self._call_ak("stock_cash_flow_sheet_by_report_em", symbol=self._em_symbol_upper(), **kwargs)
-            if mode == "yearly":
-                return self._call_ak("stock_cash_flow_sheet_by_yearly_em", symbol=self._em_symbol_upper(), **kwargs)
-            if mode == "quarterly":
-                return self._call_ak("stock_cash_flow_sheet_by_quarterly_em", symbol=self._em_symbol_upper(), **kwargs)
-            raise ValueError(f"Unsupported cash_flow_sheet mode: {mode}")
+                func_name = "stock_cash_flow_sheet_by_report_em"
+            elif mode == "yearly":
+                func_name = "stock_cash_flow_sheet_by_yearly_em"
+            elif mode == "quarterly":
+                func_name = "stock_cash_flow_sheet_by_quarterly_em"
+            else:
+                raise ValueError(f"Unsupported cash_flow_sheet mode: {mode}")
+
+            return self._call_ak_cached(
+                func_name=func_name,
+                func_kwargs={"symbol": self._em_symbol_upper()},
+                cache_id=("cash_flow_sheet", {"mode": mode}),
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+            )
 
         if endpoint == "financial_analysis_indicator":
-            use_cache = kwargs.pop("use_cache", True)
-
-            # AkShare requires start_year in some versions
-            start_year = kwargs.pop("start_year", "2010")
-
-            return self._call_ak(
-                "stock_financial_analysis_indicator",
-                symbol=self.symbol,
-                start_year=str(start_year),
+            start_year = str(kwargs.pop("start_year", "2010"))
+            return self._call_ak_cached(
+                func_name="stock_financial_analysis_indicator",
+                func_kwargs={"symbol": self.symbol, "start_year": start_year},
+                cache_id=("financial_analysis_indicator", {"start_year": start_year}),
                 use_cache=use_cache,
-                **kwargs
+                force_refresh=force_refresh,
             )
 
         if endpoint == "financial_abstract":
-            # Some versions expose it as stock_financial_abstract
-            # Doc: Sina endpoint uses 6-digit code, e.g. "600004".
-            return self._call_ak("stock_financial_abstract", symbol=self.symbol, **kwargs)
+            return self._call_ak_cached(
+                func_name="stock_financial_abstract",
+                func_kwargs={"symbol": self.symbol},
+                cache_id=("financial_abstract", {}),
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+            )
 
         if endpoint == "valuation_em":
-            use_cache = kwargs.pop("use_cache", True)
-            return self._call_ak(
-                "stock_value_em",
-                symbol=self.symbol,  # digits only
+            return self._call_ak_cached(
+                func_name="stock_value_em",
+                func_kwargs={"symbol": self.symbol},
+                cache_id=("valuation_em", {}),
                 use_cache=use_cache,
-                **kwargs
+                force_refresh=force_refresh,
             )
 
         if endpoint == "dividend_cninfo":
-            # Doc: CNINFO endpoint uses 6-digit code, e.g. "600009".
-            return self._call_ak("stock_dividend_cninfo", symbol=self.symbol, **kwargs)
+            return self._call_ak_cached(
+                func_name="stock_dividend_cninfo",
+                func_kwargs={"symbol": self.symbol},
+                cache_id=("dividend_cninfo", {}),
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+            )
 
         if endpoint == "history_dividend":
-            # Doc: this endpoint returns ALL stocks and takes no parameters.
-            return self._call_ak("stock_history_dividend", **kwargs)
+            # global table, may be huge
+            return self._call_ak_cached(
+                func_name="stock_history_dividend",
+                func_kwargs={},
+                cache_id=("history_dividend", {}),
+                use_cache=use_cache,
+                force_refresh=force_refresh,
+            )
 
         raise ValueError(f"Unsupported endpoint: {endpoint}")
 
+    # ========================= Disk Cache Utilities =========================
+
+    def _cache_file_path(self, endpoint: str, params: Dict[str, Any]) -> Path:
+        """
+        Build a stable cache file path:
+          data_dir / <symbol> / <endpoint>__<params_hash>.csv
+
+        params_hash avoids very long filenames and ensures uniqueness.
+        """
+        sym_dir = self.data_dir / self.symbol
+        sym_dir.mkdir(parents=True, exist_ok=True)
+
+        # Create a stable hash from sorted params
+        items = sorted((str(k), str(v)) for k, v in params.items())
+        raw = "|".join([f"{k}={v}" for k, v in items])
+        h = hashlib.md5(raw.encode("utf-8")).hexdigest()[:10] if raw else "noparams"
+
+        fname = f"{endpoint}__{h}.csv"
+        return sym_dir / fname
+
+    def _disk_load(self, endpoint: str, params: Dict[str, Any]) -> Optional[pd.DataFrame]:
+        path = self._cache_file_path(endpoint, params)
+        if path.exists():
+            try:
+                return pd.read_csv(path, dtype=str)  # keep raw strings to avoid dtype surprises
+            except Exception:
+                # If csv corrupted, ignore and re-fetch
+                return None
+        return None
+
+    def _disk_save(self, df: pd.DataFrame, endpoint: str, params: Dict[str, Any]) -> Path:
+        path = self._cache_file_path(endpoint, params)
+        df.to_csv(path, index=False, encoding="utf-8-sig")
+        return path
+
     # ========================= Core Utilities =========================
+
+    def _call_ak_cached(
+        self,
+        func_name: str,
+        func_kwargs: Dict[str, Any],
+        cache_id: Tuple[str, Dict[str, Any]],
+        use_cache: bool,
+        force_refresh: bool,
+    ) -> pd.DataFrame:
+        """
+        Cache order:
+        - If force_refresh: skip disk & memory, fetch from network
+        - Else if use_cache:
+            1) disk (if prefer_disk)
+            2) memory
+          If not found:
+            fetch from network -> save disk -> save memory
+        """
+        endpoint, params = cache_id
+
+        # 1) Disk cache
+        if (not force_refresh) and use_cache and self.prefer_disk:
+            hit = self._disk_load(endpoint, params)
+            if hit is not None:
+                return hit
+
+        # 2) Memory cache (optional; still useful within one run)
+        mem_key = (func_name, tuple(sorted(func_kwargs.items(), key=lambda x: x[0])))
+        if (not force_refresh) and use_cache:
+            cached = self._cache_get(mem_key)
+            if cached is not None:
+                return cached
+
+        # 3) Network fetch (AkShare)
+        df = self._call_ak(func_name, use_cache=False, **func_kwargs)
+
+        # 4) Save disk
+        if self.disk_cache and use_cache and (not force_refresh):
+            self._disk_save(df, endpoint, params)
+
+        # 5) Save memory
+        if use_cache and (not force_refresh):
+            self._cache_set(mem_key, df)
+
+        return df
 
     def _call_ak(self, func_name: str, use_cache: bool = True, **kwargs) -> pd.DataFrame:
         """
         R: func_name + kwargs
-        M: Resolve AkShare function, call with retries, rate-limit, cache
+        M: Resolve AkShare function, call with retries, rate-limit
         E: Return DataFrame
         """
-        cache_key = (func_name, tuple(sorted(kwargs.items(), key=lambda x: x[0])))
-
-        if use_cache:
-            cached = self._cache_get(cache_key)
-            if cached is not None:
-                return cached
-
         func = getattr(ak, func_name, None)
         if func is None:
             raise AttributeError(
@@ -252,14 +337,9 @@ class FundamentalData:
                     df = pd.DataFrame()
 
                 if not isinstance(df, pd.DataFrame):
-                    # Some endpoints might return dict/list; normalize to DataFrame.
                     df = pd.DataFrame(df)
 
-                # Light normalization: remove duplicated columns and reset weird indexes
                 df = self._light_clean(df)
-
-                if use_cache:
-                    self._cache_set(cache_key, df)
 
                 if self.sleep > 0:
                     time.sleep(self.sleep)
@@ -268,7 +348,6 @@ class FundamentalData:
 
             except Exception as e:
                 last_err = e
-                # Exponential-ish backoff (very mild)
                 if attempt < self.max_retries:
                     time.sleep(max(0.2, self.sleep) * (attempt + 1))
                 else:
@@ -277,7 +356,6 @@ class FundamentalData:
         raise RuntimeError(f"AkShare call failed: {func_name}, symbol={self.symbol}, err={last_err}") from last_err
 
     def _cache_get(self, key: Tuple[str, Tuple[Tuple[str, Any], ...]]) -> Optional[pd.DataFrame]:
-        """Return cached DataFrame if not expired."""
         item = self._cache.get(key)
         if item is None:
             return None
@@ -287,39 +365,18 @@ class FundamentalData:
         return item.df.copy()
 
     def _cache_set(self, key: Tuple[str, Tuple[Tuple[str, Any], ...]], df: pd.DataFrame) -> None:
-        """Store DataFrame into cache."""
         self._cache[key] = CacheItem(ts=time.time(), df=df.copy())
 
     @staticmethod
     def _light_clean(df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Minimal cleaning:
-        - Drop duplicated columns
-        - Reset index if it looks like a meaningless RangeIndex is missing
-        """
         if df.columns.duplicated().any():
             df = df.loc[:, ~df.columns.duplicated()].copy()
-
-        # Some endpoints return index as dates; keep as-is to avoid assumptions.
         return df
 
     @staticmethod
     def _normalize_stock_symbol(symbol: str) -> Tuple[str, str]:
-        """Normalize stock symbol into (code_6digit, exchange).
-
-        Notes
-        - Many AkShare endpoints accept a plain 6-digit code ("600004").
-        - Some Eastmoney financial-statement endpoints require an exchange prefix
-          ("SH600519" / "SZ000001").
-
-        Accepted inputs
-        - "601398", "sh601398", "SH601398", "601398.SH"
-        - "000001", "sz000001", "000001.SZ"
-        - "BJ430047", "430047.BJ" (will keep BJ)
-        """
         raw = str(symbol).strip()
 
-        # Extract explicit exchange if provided.
         exch: Optional[str] = None
         upper = raw.upper()
         if upper.startswith("SH"):
@@ -332,7 +389,6 @@ class FundamentalData:
             exch = "BJ"
             upper = upper[2:]
 
-        # Remove suffix like ".SH" / ".SZ" / ".BJ".
         if upper.endswith(".SH"):
             exch = exch or "SH"
             upper = upper[:-3]
@@ -343,14 +399,11 @@ class FundamentalData:
             exch = exch or "BJ"
             upper = upper[:-3]
 
-        # Keep only digits.
         digits = "".join(ch for ch in upper if ch.isdigit())
         if len(digits) != 6:
             raise ValueError(f"Invalid stock symbol (need 6 digits): {symbol}")
 
-        # Infer exchange if missing.
         if exch is None:
-            # Heuristic mapping for CN markets.
             if digits.startswith(("6", "5", "9")):
                 exch = "SH"
             elif digits.startswith(("0", "3", "2")):
@@ -363,5 +416,74 @@ class FundamentalData:
         return digits, exch
 
     def _em_symbol_upper(self) -> str:
-        """Build Eastmoney-style prefixed symbol: 'SH600519' / 'SZ000001'."""
         return f"{self.exchange.upper()}{self.symbol}"
+
+
+def print_df(df: pd.DataFrame, title: str, n: int = 10):
+    print("\n" + "=" * 80)
+    print(title)
+    print("shape =", df.shape)
+    if df.empty:
+        print("(empty)")
+    else:
+        print(df.head(n))
+
+
+if __name__ == "__main__":
+    # 1) 初始化：建议 sleep >= 0.5，避免 AkShare 接口频繁被限制
+    fd = FundamentalData(
+        symbol="601398",     # 支持: "601398", "sh601398", "601398.SH", "SZ000001" 等
+        source="em",
+        sleep=0.8,           # 每次请求后 sleep 秒
+        timeout=30,
+        cache_ttl=3600,      # 1小时内重复请求会走内存缓存
+        max_retries=2,
+    )
+
+    # 2) 基础信息（市值/流通市值等，返回 DataFrame）
+    df_info = fd.info(use_cache=True)
+    print_df(df_info, "1) stock_individual_info_em (info)")
+
+    # 3) 三大报表：资产负债表 / 利润表 / 现金流量表
+    #    mode 可选：report / yearly / quarterly（利润表、现金流支持 quarterly）
+    df_bs = fd.balance_sheet(mode="report", use_cache=True)
+    print_df(df_bs, "2) balance_sheet by report (stock_balance_sheet_by_report_em)")
+
+    df_ps = fd.profit_sheet(mode="report", use_cache=True)
+    print_df(df_ps, "3) profit_sheet by report (stock_profit_sheet_by_report_em)")
+
+    df_cf = fd.cash_flow_sheet(mode="report", use_cache=True)
+    print_df(df_cf, "4) cash_flow_sheet by report (stock_cash_flow_sheet_by_report_em)")
+
+    # 4) 财务分析指标（常用：ROE、毛利率、周转率、偿债指标等）
+    df_fa = fd.financial_analysis_indicator(start_year="2015", use_cache=True)
+    print_df(df_fa, "5) financial_analysis_indicator since 2015 (stock_financial_analysis_indicator)")
+
+    # 5) 财务摘要（如果你的 AkShare 版本没有这个 endpoint，会抛 AttributeError / RuntimeError）
+    try:
+        df_abs = fd.financial_abstract(use_cache=True)
+        print_df(df_abs, "6) financial_abstract (stock_financial_abstract)")
+    except Exception as e:
+        print("\n[financial_abstract] not available in your akshare version or endpoint changed:")
+        print("  ", repr(e))
+
+    # 6) 估值序列（PE/PB/PS/市值等，东财 stock_value_em）
+    df_val = fd.valuation_em(use_cache=True)
+    print_df(df_val, "7) valuation_em (stock_value_em)")
+
+    # 7) 分红（CNINFO）
+    df_div = fd.dividend_cninfo(use_cache=True)
+    print_df(df_div, "8) dividend_cninfo (stock_dividend_cninfo)")
+
+    # 8) 历史分红（注意：这个 endpoint 通常返回“全市场”，数据可能很大）
+    #    如果你只是想看单个股票，建议先不调这个，或在返回后自己筛选
+    try:
+        df_hist_div = fd.history_dividend(use_cache=True)
+        print_df(df_hist_div, "9) history_dividend (stock_history_dividend) - may be huge", n=3)
+    except Exception as e:
+        print("\n[history_dividend] failed or too large:")
+        print("  ", repr(e))
+
+    # 9) 缓存演示：再次调用 info，应该命中内存缓存（更快，且不会再 sleep）
+    df_info2 = fd.info(use_cache=True)
+    print("\nCache demo: second info() call, equal to first? ->", df_info2.equals(df_info))
