@@ -2,21 +2,10 @@ import akshare as ak
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
 import time
-
-
+from datetime import datetime, timedelta
 
 class SingleStock:
-    """
-    Unified A-share stock data fetcher.
-
-    source:
-        - "em"      : Eastmoney (default)
-        - "sina"    : Sina
-        - "tencent" : Tencent
-    """
-
     def __init__(
         self,
         symbol: str,
@@ -24,6 +13,10 @@ class SingleStock:
         adjust: str = "qfq",
         source: str = "em",
         sleep: float = 1.0,
+        auto_fetch: bool = True,
+        start_date: str | None = None,
+        end_date: str | None = None,
+        lookback_days: int = 365,
     ):
         self.symbol = self.normalize_symbol(symbol)
         self.period = period
@@ -37,9 +30,17 @@ class SingleStock:
             "sina": self._fetch_from_sina,
             "tencent": self._fetch_from_tencent,
         }
-
         if self.source not in self._fetcher_map:
             raise ValueError(f"Unsupported data source: {self.source}")
+
+        # --- auto fetch ---
+        if auto_fetch:
+            if end_date is None:
+                end_date = datetime.now().strftime("%Y%m%d")
+            if start_date is None:
+                sd = datetime.strptime(end_date, "%Y%m%d") - timedelta(days=lookback_days)
+                start_date = sd.strftime("%Y%m%d")
+            self.fetch(start_date, end_date)
 
     # ===================== public API =====================
     def _symbol_for_api(self) -> str:
@@ -170,13 +171,13 @@ class SingleStock:
         """
         column_map = {
             "日期": "date",
-            "open": "open",
-            "close": "close",
-            "high": "high",
-            "low": "low",
-            "volume": "volume",
-            "amount": "amount",
-            "turnover": "turnover",
+            "开盘": "open",
+            "收盘": "close",
+            "最高": "high",
+            "最低": "low",
+            "成交额": "volume",
+            "成交量": "amount",
+            "换手率": "turnover",
         }
 
         # rename columns if present
@@ -395,3 +396,73 @@ class SingleStock:
 
         return K, D, J
 
+    def TD(
+            self,
+            lookback: int = 4,
+            setup_len: int = 9,
+            price: str = "close",
+            shift_days: int = 1,
+            inplace: bool = True,
+            force: bool = False,
+    ):
+        """
+        TD Sequential simplified signals:
+          - buy[setup_len]_signal : next trading day after Buy Setup reaches setup_len
+          - sell[setup_len]_signal: next trading day after Sell Setup reaches setup_len
+
+        Returns:
+          buy_signal, sell_signal  (int Series 0/1)
+        """
+        self._require_data()
+
+        # Column names like: buy[9]_signal, sell[9]_signal (setup_len changes them)
+        buy_sig_col = f"buy[{setup_len}]_signal"
+        sell_sig_col = f"sell[{setup_len}]_signal"
+
+        if not force and (buy_sig_col in self.data.columns) and (sell_sig_col in self.data.columns):
+            bs, ss = self.data[buy_sig_col], self.data[sell_sig_col]
+            if bs.notna().any() or ss.notna().any():
+                return bs, ss
+
+        s = self.get_column(price)
+        ref = s.shift(lookback)
+
+        # bool arrays (avoid FutureWarning)
+        buy_cond = (s < ref).astype("boolean").fillna(False).to_numpy(dtype=bool)
+        sell_cond = (s > ref).astype("boolean").fillna(False).to_numpy(dtype=bool)
+
+        n = len(s)
+        buy_setup = np.zeros(n, dtype=np.int32)
+        sell_setup = np.zeros(n, dtype=np.int32)
+
+        bcnt = 0
+        scnt = 0
+        for i in range(n):
+            if buy_cond[i]:
+                bcnt += 1
+                if bcnt > setup_len:
+                    bcnt = setup_len
+            else:
+                bcnt = 0
+            buy_setup[i] = bcnt
+
+            if sell_cond[i]:
+                scnt += 1
+                if scnt > setup_len:
+                    scnt = setup_len
+            else:
+                scnt = 0
+            sell_setup[i] = scnt
+
+        buy_hit = (pd.Series(buy_setup, index=self.data.index) == setup_len)
+        sell_hit = (pd.Series(sell_setup, index=self.data.index) == setup_len)
+
+        # next-day signals
+        buy_signal = buy_hit.shift(shift_days).astype("boolean").fillna(False).astype("int8").rename(buy_sig_col)
+        sell_signal = sell_hit.shift(shift_days).astype("boolean").fillna(False).astype("int8").rename(sell_sig_col)
+
+        if inplace:
+            self.data[buy_sig_col] = buy_signal
+            self.data[sell_sig_col] = sell_signal
+
+        return buy_signal, sell_signal
