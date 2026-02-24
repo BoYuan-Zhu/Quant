@@ -466,3 +466,66 @@ class SingleStock:
             self.data[sell_sig_col] = sell_signal
 
         return buy_signal, sell_signal
+
+    def impulse_macd(
+            self,
+            fast: int = 12,
+            slow: int = 26,
+            signal: int = 9,
+            trend_ema: int = 13,
+            price: str = "close",
+            inplace: bool = True,
+            force: bool = False,
+    ):
+        """
+        Impulse MACD (Elder Impulse System) based on:
+          - Trend: slope of EMA(trend_ema)
+          - Momentum: slope of MACD histogram (HIST)
+
+        State encoding:
+          +1 : Green  (trend up AND momentum up)
+          -1 : Red    (trend down AND momentum down)
+           0 : Neutral otherwise
+
+        Returns:
+          impulse_state, trend_ema_series, hist_series
+        """
+        self._require_data()
+
+        # ---- names (aligned with your macd naming) ----
+        ema_name = f"IMPULSE_EMA{trend_ema}_{price}"
+        state_name = f"IMPULSE_STATE_EMA{trend_ema}_MACD_{fast}_{slow}_{signal}_{price}"
+
+        # Reuse if exists
+        if not force and (state_name in self.data.columns) and (ema_name in self.data.columns):
+            st = self.data[state_name]
+            ema_s = self.data[ema_name]
+            # hist name is created by your macd(); we recompute/reuse below for safety
+            _, _, hist = self.macd(fast=fast, slow=slow, signal=signal, price=price, inplace=inplace, force=force)
+            if st.notna().any() or ema_s.notna().any():
+                return st.rename(state_name), ema_s.rename(ema_name), hist
+
+        # ---- compute components ----
+        ema_tr = self.ema(trend_ema, price=price, inplace=False, force=force).rename(ema_name)
+        _, _, hist = self.macd(fast=fast, slow=slow, signal=signal, price=price, inplace=inplace, force=force)
+
+        # ---- slopes ----
+        trend_slope = ema_tr.diff()
+        mom_slope = hist.diff()
+
+        trend_up = trend_slope > 0
+        trend_dn = trend_slope < 0
+        mom_up = mom_slope > 0
+        mom_dn = mom_slope < 0
+
+        # ---- impulse state ----
+        state = pd.Series(0, index=self.data.index, dtype="int8")
+        state[trend_up & mom_up] = 1
+        state[trend_dn & mom_dn] = -1
+        state = state.rename(state_name)
+
+        if inplace:
+            self.data[ema_name] = ema_tr
+            self.data[state_name] = state
+
+        return state, ema_tr, hist
