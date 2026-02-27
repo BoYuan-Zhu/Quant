@@ -1,7 +1,6 @@
 import akshare as ak
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import time
 from datetime import datetime, timedelta
 
@@ -396,7 +395,7 @@ class SingleStock:
 
         return K, D, J
 
-    def TD(
+    def td(
             self,
             lookback: int = 4,
             setup_len: int = 9,
@@ -529,3 +528,169 @@ class SingleStock:
             self.data[state_name] = state
 
         return state, ema_tr, hist
+
+    def rsi(
+            self,
+            N: int = 14,
+            price: str = "close",
+            oversold: float = 30.0,
+            overbought: float = 70.0,
+            inplace: bool = True,
+            force: bool = False,
+    ):
+        """
+        R: Compute RSI value + RSI overbought/oversold signal; add both to self.data.
+        M: Wilder RSI. Signal:
+           RSI <= oversold  ->  1
+           RSI >= overbought-> -1
+           else             ->  0
+        E: Return (rsi_series, signal_series)
+        """
+        self._require_data()
+        if N <= 0:
+            raise ValueError("N must be positive.")
+        if not (0 < oversold < overbought < 100):
+            raise ValueError("Require 0 < oversold < overbought < 100.")
+
+        rsi_col = f"RSI_{N}_{price}"
+        sig_col = f"RSI_SIGNAL_{N}_{int(oversold)}_{int(overbought)}_{price}"
+
+        # Reuse if exists and looks valid
+        if not force and (rsi_col in self.data.columns) and (sig_col in self.data.columns):
+            rsi_exist = self.data[rsi_col]
+            sig_exist = self.data[sig_col]
+            if rsi_exist.notna().any() or sig_exist.notna().any():
+                return rsi_exist.rename(rsi_col), sig_exist.rename(sig_col)
+
+        s = self.get_column(price).astype(float)
+        delta = s.diff()
+
+        gain = delta.clip(lower=0.0)
+        loss = (-delta).clip(lower=0.0)
+
+        rsi_vals = np.full(len(s), np.nan, dtype=float)
+        g = gain.to_numpy(dtype=float)
+        l = loss.to_numpy(dtype=float)
+
+        if len(s) >= N + 1:
+            # Seed with first N simple averages (from 1..N)
+            avg_gain = np.nanmean(g[1: N + 1])
+            avg_loss = np.nanmean(l[1: N + 1])
+
+            # First RSI value at index N
+            if avg_loss == 0 and avg_gain == 0:
+                rsi_vals[N] = 50.0
+            elif avg_loss == 0:
+                rsi_vals[N] = 100.0
+            else:
+                rs = avg_gain / avg_loss
+                rsi_vals[N] = 100.0 - 100.0 / (1.0 + rs)
+
+            # Wilder smoothing recursion
+            for i in range(N + 1, len(s)):
+                if np.isnan(g[i]) or np.isnan(l[i]):
+                    rsi_vals[i] = np.nan
+                    continue
+
+                avg_gain = (avg_gain * (N - 1) + g[i]) / N
+                avg_loss = (avg_loss * (N - 1) + l[i]) / N
+
+                if avg_loss == 0 and avg_gain == 0:
+                    rsi_vals[i] = 50.0
+                elif avg_loss == 0:
+                    rsi_vals[i] = 100.0
+                else:
+                    rs = avg_gain / avg_loss
+                    rsi_vals[i] = 100.0 - 100.0 / (1.0 + rs)
+
+        rsi = pd.Series(rsi_vals, index=self.data.index, name=rsi_col)
+
+        signal = pd.Series(0, index=self.data.index, dtype="int8", name=sig_col)
+        signal[rsi <= oversold] = 1
+        signal[rsi >= overbought] = -1
+        signal[rsi.isna()] = 0
+
+        if inplace:
+            self.data[rsi_col] = rsi
+            self.data[sig_col] = signal
+
+        return rsi, signal
+
+    def bollinger(
+            self,
+            N: int = 20,
+            k: float = 2.0,
+            price: str = "close",
+            ddof: int = 0,
+            inplace: bool = True,
+            force: bool = False,
+            with_extras: bool = True,
+    ):
+        """
+        R: Compute Bollinger Bands based on rolling mean and std of `price`.
+        M: mid = MA(N), std = rolling_std(N), upper = mid + k*std, lower = mid - k*std
+        E: Return (mid, upper, lower) and optionally (bandwidth, percent_b)
+
+        Notes:
+          - ddof=0 uses population std (pandas default); ddof=1 uses sample std.
+          - bandwidth = (upper - lower) / mid
+          - percent_b = (price - lower) / (upper - lower)
+        """
+        self._require_data()
+
+        if N <= 0:
+            raise ValueError("N must be positive.")
+        if k <= 0:
+            raise ValueError("k must be positive.")
+        if ddof not in (0, 1):
+            raise ValueError("ddof must be 0 or 1.")
+
+        # Column names
+        mid_col = f"BOLL_MID_{N}_{k}_{price}"
+        up_col = f"BOLL_UP_{N}_{k}_{price}"
+        low_col = f"BOLL_LOW_{N}_{k}_{price}"
+        bw_col = f"BOLL_BW_{N}_{k}_{price}"  # bandwidth
+        pb_col = f"BOLL_PB_{N}_{k}_{price}"  # percent_b
+
+        # Reuse if exists
+        if not force:
+            needed = [mid_col, up_col, low_col] + ([bw_col, pb_col] if with_extras else [])
+            if all(c in self.data.columns for c in needed):
+                # If any has real values, assume computed
+                if any(self.data[c].notna().any() for c in needed):
+                    mid = self.data[mid_col].rename(mid_col)
+                    up = self.data[up_col].rename(up_col)
+                    low = self.data[low_col].rename(low_col)
+                    if with_extras:
+                        bw = self.data[bw_col].rename(bw_col)
+                        pb = self.data[pb_col].rename(pb_col)
+                        return mid, up, low, bw, pb
+                    return mid, up, low
+
+        s = self.get_column(price).astype(float)
+
+        mid = s.rolling(window=N, min_periods=N).mean().rename(mid_col)
+        std = s.rolling(window=N, min_periods=N).std(ddof=ddof)
+        up = (mid + k * std).rename(up_col)
+        low = (mid - k * std).rename(low_col)
+
+        if with_extras:
+            denom = (up - low).replace(0, np.nan)
+            bw = ((up - low) / mid.replace(0, np.nan)).rename(bw_col)
+            pb = ((s - low) / denom).rename(pb_col)
+
+            if inplace:
+                self.data[mid_col] = mid
+                self.data[up_col] = up
+                self.data[low_col] = low
+                self.data[bw_col] = bw
+                self.data[pb_col] = pb
+
+            return mid, up, low, bw, pb
+
+        if inplace:
+            self.data[mid_col] = mid
+            self.data[up_col] = up
+            self.data[low_col] = low
+
+        return mid, up, low
